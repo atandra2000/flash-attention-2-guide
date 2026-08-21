@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="A mathematical, systems, and theoretical field guide to exact FlashAttention-2.">
+    <title>FlashAttention-2 — an exact attention field guide</title>
+    <link rel="stylesheet" href="styles.css?v=8">
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to lesson</a>
+    <header class="hero" id="top">
+      <div class="hero-grid" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <div class="hero-inner">
+        <p class="eyebrow">Field guide / exact attention / v2</p>
+        <h1>Do not write the<br><em>attention matrix.</em></h1>
+        <p class="hero-copy">FlashAttention-2 computes the same attention result. Its advantage is treating memory movement, numerical stability, and GPU parallelism as first-class algorithmic constraints — and the argument is a tight, IO-aware proof of an asymptotic lower bound.</p>
+        <div class="hero-equation" aria-label="Output equals softmax of Q K transpose over square root d plus mask, multiplied by V">
+          <span>O</span><b>=</b><span>softmax</span><span class="formula">(QK<sup>T</sup> / √d + M)</span><span>V</span>
+        </div>
+        <div class="hero-meta"><span>Mathematics first</span><span>Exact, not approximate</span><span>Offline &amp; inspectable</span></div>
+        <div class="hero-actions" aria-label="Guide navigation">
+          <a class="hero-cta" href="#attention">Begin chapter 01 <span aria-hidden="true">→</span></a>
+          <a class="resume-link" id="resume-reading" href="#attention" hidden>Resume where you left off <span aria-hidden="true">↗</span></a>
+        </div>
+        <p class="hero-note">8 chapters · 7 live models · keyboard-friendly walkthroughs</p>
+      </div>
+    </header>
+
+    <div class="page-shell">
+      <aside class="rail" aria-label="Lesson progress">
+        <a class="rail-mark" href="#top" aria-label="Back to top">FA<sup>2</sup></a>
+        <nav>
+          <a href="#attention"><span>01</span>Attention</a>
+          <a href="#memory-wall"><span>02</span>Memory wall</a>
+          <a href="#online-softmax"><span>03</span>Online softmax</a>
+          <a href="#flash2"><span>04</span>FlashAttention-2</a>
+          <a href="#kernel"><span>05</span>Kernel &amp; backward</a>
+          <a href="#extensions"><span>06</span>Extensions</a>
+          <a href="#comparison"><span>07</span>Landscape</a>
+          <a href="#foundations"><span>08</span>Foundations</a>
+        </nav>
+        <div class="rail-progress" aria-live="polite" aria-atomic="true">
+          <span class="rail-progress-label">Reading</span>
+          <strong id="rail-progress-text">Chapter 01 / 08</strong>
+          <span class="rail-progress-track" aria-hidden="true"><span id="rail-progress-fill"></span></span>
+        </div>
+      </aside>
+
+      <main id="content">
+        <section class="opening section" aria-labelledby="route-title">
+          <p class="eyebrow">Reading route</p>
+          <h2 id="route-title">A speed story that starts with a proof.</h2>
+          <p>First establish the operation as a map <span class="math-inline">f : Q,K,V ↦ O</span> and write down its data-movement lower bound. Then derive the small state <span class="math-inline">(m, ℓ, o)</span> that lets a kernel stream tiles while preserving the exact softmax. FlashAttention-2 does not change the model’s attention rule; it improves how that exact rule is scheduled on a memory-bound accelerator. Foundations at the end of the page prove every claim the chapters only assert.</p>
+          <div class="compare-strip" role="list" aria-label="Attention implementation comparison">
+            <article role="listitem"><p class="tiny-label">Naive attention</p><strong>materializes S and P</strong><span>Easy to express; O(N²) intermediate HBM traffic; memory-bound for large N.</span></article>
+            <article role="listitem"><p class="tiny-label">FlashAttention (v1)</p><strong>tiles exact softmax</strong><span>Streams K/V blocks; O(N²d / B) HBM accesses; on-chip state is O(d) per row.</span></article>
+            <article role="listitem"><p class="tiny-label">FlashAttention-2 (v2)</p><strong>partitions work better</strong><span>Less scalar work, more blocks, sliced-Q avoids cross-warp reduction.</span></article>
+          </div>
+        </section>
+
+        <section class="section chapter" id="attention" aria-labelledby="attention-title">
+          <div class="chapter-index">01</div>
+          <div class="chapter-heading"><p class="eyebrow">The operation</p><h2 id="attention-title">Scaled dot-product attention, exactly.</h2></div>
+          <div class="prose-grid">
+            <div>
+              <div class="tag-row"><span>definition</span><span>one head</span><span>shape ledger</span></div>
+              <p>For one head with sequence length <span class="math-inline">N</span> and head dimension <span class="math-inline">d</span>, the inputs are three matrices: a query matrix <span class="math-inline">Q ∈ ℝ<sup class="math-inline">N×d</sup></span>, a key matrix <span class="math-inline">K ∈ ℝ<sup class="math-inline">N×d</sup></span>, and a value matrix <span class="math-inline">V ∈ ℝ<sup class="math-inline">N×d</sup></span>. Each row of Q is the “what this token is looking for” vector, each row of K is the “what this token offers” vector, and each row of V is the payload that gets re-weighted. The output is a single matrix O ∈ ℝ<sup class="math-inline">N×d</sup> where row i is a convex combination of value rows, with weights determined by the similarity of query i to every key.</p>
+
+              <h3>Start one step earlier: where Q, K, and V come from</h3>
+              <p>The model does not receive queries and keys from the tokenizer. It first turns each token into a learned residual-stream vector. Stack those vectors as <span class="math-inline">X ∈ ℝ<sup>N×d<sub>model</sub></sup></span>. One attention head applies three learned linear projections: <span class="math-inline">Q = XW<sub>Q</sub></span>, <span class="math-inline">K = XW<sub>K</sub></span>, and <span class="math-inline">V = XW<sub>V</sub></span>, where every projection has shape <span class="math-inline">W ∈ ℝ<sup>d<sub>model</sub>×d</sup></span>. The three projections let one token ask a question, advertise what it matches, and offer information to copy using different learned coordinate systems.</p>
+              <div class="concept-strip" aria-label="From token vectors to an attention output">
+                <article><p class="tiny-label">1 / represent</p><strong>X</strong><span>One row per token: the current meaning of each position.</span></article>
+                <article><p class="tiny-label">2 / project</p><strong>Q, K, V</strong><span>Three learned views of the same token vector, each with a different job.</span></article>
+                <article><p class="tiny-label">3 / retrieve</p><strong>O = PV</strong><span>Each query mixes value rows according to query–key compatibility.</span></article>
+              </div>
+
+              <p class="math-block" aria-label="Scaled dot-product attention definition">
+                <span class="label">definition · scaled dot-product attention</span>
+                <span>S</span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">Q K<sup>T</sup></span><span class="den">√d</span></span> &nbsp;&nbsp;,
+                <span>P</span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">exp(S + M)</span><span class="den">1<sup>T</sup> exp(S + M)</span></span> &nbsp;&nbsp;,
+                <span>O</span> <span class="math-eq">=</span> <span>P V</span>
+              </p>
+
+              <p>Reading it row-by-row, the three maps are: (1) a similarity matrix <span class="math-inline">S ∈ ℝ<sup class="math-inline">N×N</sup></span> whose entry <span class="math-inline">S<sub>ij</sub></span> measures how compatible query <span class="math-inline">i</span> is with key <span class="math-inline">j</span>; (2) a row-softmax that turns each row of <span class="math-inline">S</span> into a probability distribution, with an optional additive mask <span class="math-inline">M ∈ {0, −∞}<sup>N×N</sup></span> (e.g. causal); and (3) a weighted average of value rows using the probabilities.</p>
+
+              <h3>Why <span class="math-inline">1/√d</span> ?</h3>
+              <p>If <span class="math-inline">q, k</span> are independent components with zero mean and unit variance, then the dot product <span class="math-inline">q · k = Σ<sub>i=1</sub><sup>d</sup> q<sub>i</sub> k<sub>i</sub></span> has variance <span class="math-inline">d</span>. Without a scale, the logits grow in magnitude with dimension, and softmax saturates: one entry approaches <span class="math-inline">1</span>, all others approach <span class="math-inline">0</span>. The gradient through softmax then vanishes and training stalls. Dividing by <span class="math-inline">√d</span> keeps the score variance near <span class="math-inline">1</span> regardless of <span class="math-inline">d</span>, which keeps softmax in its well-conditioned regime.</p>
+
+              <p class="math-block derivation compact" aria-label="Why 1 over square root of d">
+                <span class="label cyan">derivation · score variance under scale</span>
+                <span class="math-frac"><span class="num">Var(S<sub>ij</sub>)</span><span class="den">1</span></span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">Var(q<sub>i</sub> · k<sub>j</sub>)</span><span class="den">d</span></span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">d · Var(q<sub>i</sub>) · Var(k<sub>j</sub>)</span><span class="den">d</span></span> <span class="math-eq">=</span> 1
+              </p>
+
+              <h3>The quadratic bottleneck</h3>
+              <p>Every token attends to every other token. The <span class="math-inline">N × N</span> intermediate <span class="math-inline">S</span> (and the equal-sized <span class="math-inline">P</span>) is the source of attention’s expressiveness and its cost. For <span class="math-inline">N = 4 096</span>, that is <span class="math-inline">1.6 × 10<sup>7</sup></span> entries per head. For <span class="math-inline">N = 65 536</span>, it is <span class="math-inline">4.3 × 10<sup>9</sup></span>. The output is only <span class="math-inline">N × d</span>, but the <span class="math-inline">N × N</span> intermediates dominate memory traffic. The mathematical definition does not require materializing those intermediates; they are an artifact of writing the operation as three sequential dense passes.</p>
+
+              <h3>Mask, dropout, and the contract on exactness</h3>
+              <p>A causal language model uses a mask <span class="math-inline">M</span> with <span class="math-inline">M<sub>ij</sub> = 0</span> for <span class="math-inline">j ≤ i</span> and <span class="math-inline">M<sub>ij</sub> = −∞</span> otherwise, so position <span class="math-inline">i</span> cannot see future tokens. <span class="math-inline">exp(−∞) = 0</span>, so masked columns contribute nothing to the softmax. Attention dropout (when used in training) multiplies the post-softmax <span class="math-inline">P</span> by an independent Bernoulli mask; the same mask must be re-applied on the backward pass, which is why implementations deterministically regenerate it rather than persist the full probability matrix. The contract throughout this guide is that “exact” means the same mathematical operation as a triple-pass reference — bitwise equality is not the target, only equivalence of the floating-point result up to normal rounding error.</p>
+            </div>
+            <aside class="callout"><p class="tiny-label">Shape ledger</p><dl><div><dt>Q, K, V</dt><dd>N × d</dd></div><div><dt>QK<sup>T</sup></dt><dd>N × N</dd></div><div><dt>softmax rows</dt><dd>Σ = 1</dd></div><div><dt>O = PV</dt><dd>N × d</dd></div></dl><p>Multi-head attention repeats this per head and concatenates. The bottleneck already appears at one head, so the kernel is derived there.</p></aside>
+          </div>
+
+          <div class="widget attention-widget" id="attention-calc" data-widget="attention">
+            <div class="widget-heading"><div><p class="tiny-label">Worked micro-example</p><h3>Attention calculator, step by step</h3></div><p>Two queries attend to three keys. Values are scalars so every output is easy to inspect. Step walks through <span class="math-inline">QK<sup>T</sup> → softmax → PV</span>; the same three passes the naive kernel executes.</p></div>
+            <div class="matrix-layout">
+              <div class="matrix-card"><span>Q</span><code>[[1, 0], [0, 1]]</code></div>
+              <div class="operator">×</div>
+              <div class="matrix-card"><span>K<sup>T</sup></span><code>[[1, 0, 1], [0, 1, 1]]</code></div>
+              <div class="operator">=</div>
+              <div class="matrix-card" id="att-step-card"><span id="att-step-label">scores</span><code id="score-output">[[0.707, 0, 0.707], [0, 0.707, 0.707]]</code></div>
+            </div>
+            <div class="widget-actions">
+              <button type="button" id="att-prev" aria-label="Previous step">← Prev</button>
+              <button type="button" id="att-next" aria-label="Next step">Next →</button>
+              <span class="att-step-indicator" id="att-step-indicator">step 1 / 3</span>
+            </div>
+            <div class="io-stats attention-stats">
+              <div><p class="tiny-label"><span class="math-inline">S = QK<sup>T</sup> / √d</span></p><strong id="att-stage1">[[0.707, 0, 0.707], [0, 0.707, 0.707]]</strong><p class="io-formula">N × N scores</p></div>
+              <div><p class="tiny-label"><span class="math-inline">P = softmax(S)</span></p><strong id="att-stage2">[[0.401, 0.198, 0.401], [0.198, 0.401, 0.401]]</strong><p class="io-formula">rows sum to 1</p></div>
+              <div><p class="tiny-label"><span class="math-inline">O = PV</span></p><strong id="attention-output">[[3.401], [3.604]]</strong><p class="io-formula">N × d output</p></div>
+            </div>
+            <p class="widget-status" id="attention-status" aria-live="polite">Step 1 of 3: scores. The next step subtracts each row's maximum, exponentiates, and normalizes; the final step multiplies the probabilities by V.</p>
+          </div>
+        </section>
+
+        <section class="section chapter" id="memory-wall" aria-labelledby="memory-title">
+          <div class="chapter-index">02</div>
+          <div class="chapter-heading"><p class="eyebrow">The constraint</p><h2 id="memory-title">The memory wall, not the FLOP count.</h2></div>
+          <div class="prose-grid">
+            <div>
+              <div class="tag-row"><span>HBM</span><span>arithmetic intensity</span><span>lower bound</span></div>
+              <p>Matrix multiplication is highly optimized on a GPU. The problem with the naive decomposition is the data-movement shape: compute <span class="math-inline">S</span>, write it to HBM; read <span class="math-inline">S</span> for softmax, write <span class="math-inline">P</span>; read <span class="math-inline">P</span> and <span class="math-inline">V</span> for the final product. Both <span class="math-inline">S</span> and <span class="math-inline">P</span> are <span class="math-inline">N × N</span>, and the round-trips to HBM dominate runtime for realistic <span class="math-inline">N</span>.</p>
+
+              <h3>Follow one score tile’s lifetime</h3>
+              <p>“Materialize” means <em>give an intermediate a long-lived address in HBM</em>. A conventional implementation cannot hand the scores from the first GEMM directly to the softmax kernel, because they are separate GPU launches. It must write the score tile out, then load it again later. The same thing happens to the probabilities before the <span class="math-inline">PV</span> GEMM. FlashAttention changes the lifetime, not the answer: a score tile exists only long enough to update <span class="math-inline">m</span>, <span class="math-inline">ℓ</span>, and <span class="math-inline">o</span>, then its storage is reused for the next tile.</p>
+              <div class="concept-strip" aria-label="Naive and streamed attention data lifetimes">
+                <article><p class="tiny-label">Naive / score</p><strong>S: HBM write</strong><span>QK<sup>T</sup> produces N² scores, then the next kernel must load them back.</span></article>
+                <article><p class="tiny-label">Naive / probability</p><strong>P: HBM write</strong><span>Softmax produces another N² matrix before PV can consume it.</span></article>
+                <article><p class="tiny-label">Flash / tile</p><strong>SRAM only</strong><span>Score and local weights update a small row state, then disappear before HBM sees them.</span></article>
+              </div>
+
+              <h3>Arithmetic intensity: the only metric that matters here</h3>
+              <p>Arithmetic intensity is the ratio of floating-point operations to bytes of HBM traffic. A kernel is <em>compute-bound</em> when its intensity exceeds what the hardware can sustain; it is <em>memory-bound</em> when the HBM bandwidth is the constraint. The naive attention has <span class="math-inline">Θ(N²d)</span> FLOPs and <span class="math-inline">Θ(N²)</span> bytes of intermediate traffic, so its intensity is <span class="math-inline">Θ(d)</span> — about <span class="math-inline">64</span>–<span class="math-inline">256</span> FLOPs/byte. On an A100 that number is well below the ridge point of the roofline, so naive attention spends most of its time waiting for HBM.</p>
+
+              <p class="math-block compact" aria-label="Arithmetic intensity of naive attention">
+                <span class="label">lower bound · intensity of naive attention</span>
+                <span class="math-frac"><span class="num">FLOPs</span><span class="den">HBM bytes</span></span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">Θ(N²d)</span><span class="den">Θ(N²)</span></span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">Θ(d)</span><span class="den">1</span></span> &nbsp;&nbsp;,&nbsp;&nbsp; with d = 64, 128, 256
+              </p>
+
+              <h3>The GPU memory hierarchy</h3>
+              <p>Think of GPU memory as a pyramid, smaller and faster toward the bottom:</p>
+              <ul>
+                <li><strong>HBM (global memory)</strong>: 80 GB on A100, 3.35 TB/s of bandwidth, ~400 cycles of latency. Large, but slow relative to on-chip storage.</li>
+                <li><strong>L2 cache</strong>: 40 MB on A100, faster than HBM, still shared across all SMs.</li>
+                <li><strong>Shared memory</strong>: ~100 KB usable per SM on A100, programmer-managed, on-chip, ~100× faster than HBM.</li>
+                <li><strong>Registers</strong>: 64 KB per SM, private to each thread, the fastest level but extremely limited.</li>
+              </ul>
+
+              <p>FlashAttention’s structural choice is: once a tile of Q, K, or V is loaded into shared memory, that tile participates in <em>many</em> multiply-accumulate operations before being evicted. Each HBM byte amortizes more FLOPs, the arithmetic intensity rises, and the kernel moves toward the compute-bound side of the roofline.</p>
+
+              <h3>Why not larger tiles?</h3>
+              <p>Shared memory is a fixed budget per thread block. A tile of size <span class="math-inline">B<sub>r</sub> × B<sub>c</sub></span> for the partial scores, plus <span class="math-inline">B<sub>r</sub> × d</span> for Q and <span class="math-inline">B<sub>c</sub> × d</span> for K and V, must all fit in on-chip storage simultaneously. The published choice is <span class="math-inline">B<sub>r</sub> = 64</span>, <span class="math-inline">B<sub>c</sub> = 64</span>, <span class="math-inline">d ∈ {64, 128, 256}</span>. Larger tiles would exceed capacity and force spilling; smaller tiles would underutilize the tensor cores.</p>
+            </div>
+            <figure class="memory-figure">
+              <svg viewBox="0 0 720 460" role="img" aria-labelledby="memory-caption">
+                <title id="memory-caption">GPU memory hierarchy: HBM, L2, shared memory, registers — with capacity, bandwidth, and latency on A100</title>
+                <rect x="14" y="14" width="692" height="432" rx="8" class="svg-frame"/>
+
+                <g aria-label="HBM tier">
+                  <rect x="40" y="40" width="640" height="100" rx="6" class="svg-hbm"/>
+                  <text x="58" y="74">HBM · global memory</text>
+                  <text x="58" y="100" class="svg-muted">~80 GB · 3.35 TB/s · ~400 cycles</text>
+                  <text x="58" y="124" class="svg-tag">large · slow · shared across SMs</text>
+                </g>
+
+                <g aria-label="L2 tier">
+                  <rect x="100" y="164" width="520" height="72" rx="6" class="svg-l2"/>
+                  <text x="118" y="194">L2 cache</text>
+                  <text x="118" y="218" class="svg-muted">~40 MB · faster than HBM</text>
+                </g>
+
+                <g aria-label="shared memory tier">
+                  <rect x="170" y="260" width="380" height="72" rx="6" class="svg-shared"/>
+                  <text x="188" y="290">shared memory</text>
+                  <text x="188" y="314" class="svg-muted">~100 KB / SM · on-chip</text>
+                </g>
+
+                <g aria-label="registers tier">
+                  <rect x="276" y="356" width="168" height="48" rx="5" class="svg-register"/>
+                  <text x="296" y="386">registers</text>
+                </g>
+
+                <g aria-label="scale label on the right">
+                  <text x="460" y="370" class="svg-muted">64 KB / SM</text>
+                  <text x="460" y="388" class="svg-muted">thread-private</text>
+                </g>
+
+                <g aria-label="FlashAttention tile reuse arrow">
+                  <path d="M188 296 L150 296 L150 442 L276 442 L276 404" class="svg-reuse"/>
+                  <text x="156" y="458" class="svg-reuse-tag">tile reused across the Q row</text>
+                </g>
+              </svg>
+              <figcaption>Each level trades capacity for speed. FlashAttention keeps one K/V tile in shared memory and reuses it across the whole Q row.</figcaption>
+            </figure>
+          </div>
+
+          <div class="widget tile-widget" id="tile-size" data-widget="tiles">
+            <div class="widget-heading"><div><p class="tiny-label">IO estimator</p><h3>HBM traffic, naive vs FlashAttention-2</h3></div><p>Move the sliders. The naive path writes and re-reads two <span class="math-inline">N × N</span> intermediates; the streamed path keeps only the output and <span class="math-inline">Θ(N)</span> statistics on chip.</p></div>
+            <div class="io-controls">
+              <div class="io-control">
+                <label for="sequence-length">Sequence length <span class="math-inline">N</span> <output id="sequence-value">4 096</output></label>
+                <input id="sequence-length" type="range" min="256" max="32768" step="256" value="4096" aria-describedby="tile-status">
+              </div>
+              <div class="io-control">
+                <label for="head-dim">Head dimension <span class="math-inline">d</span> <output id="head-dim-value">128</output></label>
+                <input id="head-dim" type="range" min="32" max="256" step="32" value="128" aria-describedby="tile-status">
+              </div>
+              <div class="io-control">
+                <label for="tile-size-input">Q-block size <span class="math-inline">B<sub>r</sub></span> <output id="tile-size-value">64</output></label>
+                <input id="tile-size-input" type="range" min="32" max="128" step="32" value="64" aria-describedby="tile-status">
+              </div>
+            </div>
+            <div class="io-bars">
+              <div class="io-row">
+                <p class="tiny-label">naive attention · total HBM traffic</p>
+                <div class="io-bar" id="bar-naive" aria-hidden="true"></div>
+                <p class="io-total"><span id="naive-total">—</span> <span class="io-unit">bytes / head</span></p>
+              </div>
+              <div class="io-row">
+                <p class="tiny-label">FlashAttention-2 · total HBM traffic</p>
+                <div class="io-bar fa" id="bar-fa" aria-hidden="true"></div>
+                <p class="io-total"><span id="fa-total">—</span> <span class="io-unit">bytes / head</span></p>
+              </div>
+            </div>
+            <div class="io-legend">
+              <span class="legend-hbm">Q, K, V load</span>
+              <span class="legend-compute">N×N intermediates (naive only)</span>
+              <span class="legend-output">O write + statistics</span>
+            </div>
+            <div class="io-stats">
+              <div><p class="tiny-label">arithmetic intensity · naive</p><strong id="intensity-naive">—</strong><p class="io-formula">FLOPs / HBM byte = <span class="math-inline">4N²d / (8Nd + 8N²)</span></p></div>
+              <div><p class="tiny-label">arithmetic intensity · FA-2</p><strong id="intensity-fa">—</strong><p class="io-formula">FLOPs / HBM byte = <span class="math-inline">4N²d / (8Nd + 8)</span></p></div>
+              <div><p class="tiny-label">HBM speed-up</p><strong id="traffic-ratio">—</strong><p class="io-formula">naive bytes / FA-2 bytes</p></div>
+            </div>
+            <p class="widget-status" id="tile-status" aria-live="polite">At N = 4 096, d = 128 in FP16/BF16, the naive path moves about 134 MiB per head through HBM; the streamed path moves about 2 MiB. The 64× reduction matches the IO lower bound proved in chapter 08.</p>
+          </div>
+        </section>
+
+        <section class="section chapter" id="online-softmax" aria-labelledby="softmax-title">
+          <div class="chapter-index">03</div>
+          <div class="chapter-heading"><p class="eyebrow">The invariant</p><h2 id="softmax-title">Online softmax makes tiling exact.</h2></div>
+          <div class="prose-grid">
+            <div>
+              <div class="tag-row"><span>translation invariance</span><span>associative merge</span><span>stability</span></div>
+              <p>Softmax looks global: each row probability needs the sum of exponentials across the entire row. Stable softmax subtracts the row maximum first, and that maximum — together with the normalizer — can be maintained incrementally. For each query row, retain just three pieces of on-chip state: the running maximum <span class="math-inline">m</span>, the normalizer <span class="math-inline">ℓ</span>, and the unnormalized output numerator <span class="math-inline">o</span>.</p>
+
+              <h3>What the three numbers remember</h3>
+              <p>Imagine reading a long row of scores through a narrow window. You do <em>not</em> need to remember every earlier score. You need only: the best score seen so far (<span class="math-inline">m</span>), the total probability mass in the current coordinate system (<span class="math-inline">ℓ</span>), and the value-weighted mass (<span class="math-inline">o</span>). The final division <span class="math-inline">o / ℓ</span> converts that unnormalized weighted sum into the ordinary weighted average. A new tile never changes the old tokens; it merely expresses their contribution in the new tile’s numerical reference frame.</p>
+
+              <p class="math-block" aria-label="Online softmax update rule">
+                <span class="label">definition · online softmax update for one K/V block</span>
+                <div class="math-row"><span class="tag">m′</span><span>=</span><span>max(m, max<sub>j ∈ J</sub> S<sub>j</sub>)</span></div>
+                <div class="math-row"><span class="tag">ℓ′</span><span>=</span><span>e<sup>m − m′</sup> · ℓ + Σ<sub>j ∈ J</sub> e<sup>S<sub>j</sub> − m′</sup></span></div>
+                <div class="math-row"><span class="tag">o′</span><span>=</span><span>e<sup>m − m′</sup> · o + Σ<sub>j ∈ J</sub> e<sup>S<sub>j</sub> − m′</sup> · v<sub>j</sub></span></div>
+                <div class="math-row"><span class="tag">O</span><span>=</span><span>o / ℓ</span><span class="math-cond"> (after all blocks)</span></div>
+              </p>
+
+              <p>When a new block raises the maximum, multiply the old accumulator by the matching rescaling factor. That one correction preserves every old contribution at the new numerical reference point. No approximation is introduced: the result is mathematically identical to a full-row softmax. Floating-point bits may differ from another valid evaluation order because additions are reassociated.</p>
+
+              <h3>Derivation: why rescaling is exact</h3>
+              <p>Start with the standard stable softmax for a full row. Let <span class="math-inline">m = max<sub>i</sub> S<sub>i</sub></span>. Then</p>
+
+              <p class="math-block derivation" aria-label="Stable softmax derivation">
+                <span class="label cyan">derivation · stable softmax</span>
+                <span class="math-frac"><span class="num">exp(S<sub>i</sub>)</span><span class="den">Σ<sub>j</sub> exp(S<sub>j</sub>)</span></span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">exp(S<sub>i</sub> − m)</span><span class="den">Σ<sub>j</sub> exp(S<sub>j</sub> − m)</span></span> &nbsp;&nbsp;,
+                <span class="math-cond">with all exponents ≤ 0</span>
+              </p>
+
+              <p>Now imagine having processed the first <span class="math-inline">j</span> elements of a row and stored three numbers:</p>
+              <ul>
+                <li><span class="math-inline">m<sub>j</sub></span> — the maximum of the first <span class="math-inline">j</span> scores.</li>
+                <li><span class="math-inline">ℓ<sub>j</sub> = Σ<sub>i ≤ j</sub> exp(S<sub>i</sub> − m<sub>j</sub>)</span> — the normalizer referenced to that running maximum.</li>
+                <li><span class="math-inline">o<sub>j</sub> = Σ<sub>i ≤ j</sub> exp(S<sub>i</sub> − m<sub>j</sub>) · v<sub>i</sub></span> — the unnormalized weighted sum of values.</li>
+              </ul>
+              <p>When the next block arrives with new maximum <span class="math-inline">m<sub>new</sub></span>, two cases can occur:</p>
+              <ol>
+                <li><strong>m<sub>new</sub> ≤ m<sub>j</sub></strong>: the running maximum already dominates. Rescale only the new contributions by <span class="math-inline">exp(m<sub>new</sub> − m<sub>j</sub>) ≤ 1</span>.</li>
+                <li><strong>m<sub>new</sub> &gt; m<sub>j</sub></strong>: the new maximum is larger. Rescale <em>all</em> old contributions by <span class="math-inline">exp(m<sub>j</sub> − m<sub>new</sub>) &lt; 1</span> so they become referenced to <span class="math-inline">m<sub>new</sub></span>, then add the (already-scaled) new contributions.</li>
+              </ol>
+
+              <p class="math-block derivation" aria-label="Rescaling identity">
+                <span class="label cyan">key identity · telescoping rescale</span>
+                <span>exp(m<sub>old</sub> − m<sub>new</sub>) · exp(m<sub>new</sub> − m<sub>latest</sub>)</span> <span class="math-eq">=</span> <span>exp(m<sub>old</sub> − m<sub>latest</sub>)</span>
+              </p>
+
+              <p>Rescaling is <em>associative</em>. No matter how many times the running maximum is updated, the final contributions are all referenced to the same value — and the resulting <span class="math-inline">o / ℓ</span> is mathematically identical to a one-shot softmax over the full row. Floating-point implementations can differ by normal rounding error because they add terms in a different order.</p>
+
+              <h3>Numerical stability</h3>
+              <p>Without max-subtraction, <span class="math-inline">exp(100)</span> overflows and <span class="math-inline">exp(−100)</span> underflows to zero. By always subtracting the current running maximum, every exponent lies in <span class="math-inline">(0, 1]</span>; the rescaling factors are in <span class="math-inline">(0, 1]</span>; and the intermediate <span class="math-inline">o</span> is a sum of non-negative terms, so no overflow occurs. In fact, the per-tile computation tends to be <em>more</em> stable than the one-shot baseline: catastrophic cancellation in the exponent is reduced because each tile’s local maximum is small in magnitude relative to the global maximum, and the rescaling factors smooth out the dynamic range.</p>
+
+              <h3>Why associativity unlocks parallelism</h3>
+              <p>The merge rule is associative: combining two independent states <span class="math-inline">(m<sub>a</sub>, ℓ<sub>a</sub>, o<sub>a</sub>)</span> and <span class="math-inline">(m<sub>b</sub>, ℓ<sub>b</sub>, o<sub>b</sub>)</span> gives the same result regardless of whether they were produced by the same block, different blocks on the same SM, or different GPUs communicating over the network. The merge itself is</p>
+
+              <p class="math-block lemma compact" aria-label="Associative merge rule">
+                <span class="label green">merge · two partial states</span>
+                <div class="math-row"><span class="tag">m</span><span>=</span><span>max(m<sub>a</sub>, m<sub>b</sub>)</span></div>
+                <div class="math-row"><span class="tag">ℓ</span><span>=</span><span>e<sup>m<sub>a</sub> − m</sup> ℓ<sub>a</sub> + e<sup>m<sub>b</sub> − m</sup> ℓ<sub>b</sub></span></div>
+                <div class="math-row"><span class="tag">o</span><span>=</span><span>e<sup>m<sub>a</sub> − m</sup> o<sub>a</sub> + e<sup>m<sub>b</sub> − m</sup> o<sub>b</sub></span></div>
+              </p>
+
+              <p>This is the structural reason FlashAttention scales: the same merge composes within a block, across blocks, across SMs, and across GPUs. The Foundations chapter proves the merge is associative and that it preserves the softmax exactly.</p>
+            </div>
+            <aside class="boundary"><strong>Exactness boundary.</strong> A floating-point kernel may differ from another valid evaluation order by normal rounding error. It computes the same mathematical attention operation, not a low-rank, sparse, or linear-attention substitute.</aside>
+          </div>
+
+          <div class="widget state-widget" data-widget="streaming">
+            <div class="widget-heading"><div><p class="tiny-label">State microscope</p><h3>One row, two K/V tiles</h3></div><p>Step through a query row and watch the running state <span class="math-inline">(m, ℓ, o)</span> absorb one K/V tile at a time. The second preset shows the rescale: the running maximum is raised by tile 2.</p></div>
+            <div class="segmented" role="group" aria-label="Choose demo">
+              <button type="button" class="selected" data-state-demo="same-max" aria-pressed="true">No rescale · q=[1, 0]</button>
+              <button type="button" data-state-demo="new-max" aria-pressed="false">Rescale case · q=[0, 5]</button>
+            </div>
+            <div class="state-layout">
+              <div class="state-strip" id="state-strip" aria-hidden="true">
+                <p class="tiny-label">score strip · S<sub>q</sub> across K positions</p>
+                <div class="state-cells" id="state-cells"></div>
+                <p class="state-tile-progress">
+                  <span class="state-progress-label">tile progress</span>
+                  <span class="state-progress-bar"><span id="state-progress-fill"></span></span>
+                  <span class="state-progress-text" id="state-progress-text">0 / 2</span>
+                </p>
+              </div>
+              <div class="state-flow state-flow-compact" id="state-flow" aria-live="polite">
+                <div><span>tile</span><strong id="state-tile">—</strong></div>
+                <div><span>m</span><strong id="state-max">−∞</strong></div>
+                <div><span>ℓ</span><strong id="state-norm">0</strong></div>
+                <div><span>o</span><strong id="state-numerator">0</strong></div>
+                <div><span>O = o / ℓ</span><strong id="state-output">—</strong></div>
+              </div>
+            </div>
+            <div class="online-ledger" aria-live="polite">
+              <div><p class="tiny-label">old-state scale</p><strong id="state-old-scale">—</strong><p class="io-formula">exp(m<sub>old</sub> − m<sub>new</sub>)</p></div>
+              <div><p class="tiny-label">new tile mass</p><strong id="state-new-mass">—</strong><p class="io-formula">Σ exp(s<sub>tile</sub> − m<sub>new</sub>)</p></div>
+              <div><p class="tiny-label">merge meaning</p><strong id="state-merge-rule">—</strong><p class="io-formula">old contribution + current tile contribution</p></div>
+            </div>
+            <div class="widget-actions"><button id="state-step" type="button">Step tile</button><button id="state-play" type="button" aria-pressed="false">Play</button><button id="state-reset" type="button">Reset</button></div>
+            <p class="widget-status" id="state-status" aria-live="polite">Start with an empty state. The final result matches full-row softmax.</p>
+          </div>
+        </section>
+
+        <section class="section chapter" id="flash2" aria-labelledby="flash2-title">
+          <div class="chapter-index">04</div>
+          <div class="chapter-heading"><p class="eyebrow">The sequel</p><h2 id="flash2-title">FlashAttention-2: better parallelism and work partitioning.</h2></div>
+
+          <p>FlashAttention-1 already minimizes HBM traffic — the kernel is asymptotically optimal in IO. FlashAttention-2 then targets the remaining gap to peak GEMM throughput. Its paper describes three changes: reduce non-matmul scalar work, schedule independent <em>query blocks</em> from one long head across more thread blocks, and divide work across warps so they communicate less through shared memory.</p>
+
+          <h3>1. Keep tensor cores busy</h3>
+          <p>GPU matrix units are dramatically faster than scalar floating-point instructions. FA-2 therefore keeps the output in the unnormalized form already used by this guide: <span class="math-inline">o = Σ exp(s − m)v</span>. It rescales only when a tile changes the running maximum, and divides by <span class="math-inline">ℓ</span> once at the end instead of repeatedly normalizing the partial output. It also saves one row-wise <span class="math-inline">L = m + log ℓ</span> value for backward rather than separate <span class="math-inline">m</span> and <span class="math-inline">ℓ</span> values. The output is unchanged; the instruction mix shifts toward tensor cores.</p>
+
+          <p class="math-block compact" aria-label="Amortized scalar work per block">
+            <span class="label">amortization · scalar ops per Q-tile</span>
+            <span class="math-frac"><span class="num">scalar FLOPs</span><span class="den">tensor-core FLOPs</span></span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">O(d)</span><span class="den">O(B<sub>c</sub> · d)</span></span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">O(1)</span><span class="den">B<sub>c</sub></span></span> &nbsp;&nbsp;,
+            <span class="math-cond">FA-2 maximizes B<sub>c</sub> within the shared-memory budget</span>
+          </p>
+
+          <h3>2. Sequence-length parallelism</h3>
+          <p>FA-1 primarily exposes one thread block per batch–head pair. If batch × heads is smaller than the GPU’s SM count, many SMs have no block to execute. FA-2 adds <strong>sequence-length parallelism</strong> by assigning independent outer-loop query blocks to separate thread blocks. Each block owns a disjoint slice of output rows and streams all needed K/V tiles, so forward blocks do not need to merge partial rows. Long sequences now create enough independent Q blocks to occupy the machine even when the batch is small.</p>
+
+          <h3>3. Sliced-Q work partitioning</h3>
+          <p>A thread block contains several warps (typically 4 on A100). In FA-1, every warp cooperated on the <em>same</em> output rows, which required shared-memory reductions. FA-2 assigns each warp a <em>different</em> slice of query rows (sliced-Q). Warps still share the same K/V tile loaded into shared memory — but their output rows are disjoint, so no cross-warp reduction is needed. The shared-memory traffic inside a block drops to the bare minimum.</p>
+
+          <div class="math-block" aria-label="FA1 vs FA2 work partitioning">
+            <span class="label">comparison · FA-1 sliced-K vs FA-2 sliced-Q</span>
+            <div class="math-row"><span class="tag">FA-1</span><span>warp owns K/V slice</span><span>·</span><span>cross-warp reduce over partial outputs</span></div>
+            <div class="math-row"><span class="tag">FA-2</span><span>warp owns Q slice</span><span>·</span><span>independent outputs, no shared-memory reduction</span></div>
+          </div>
+
+          <div class="three-up">
+            <article><p class="tiny-label">01 / arithmetic</p><h3>Keep tensor cores busy</h3><p>Rescaling and softmax work is batched so each tensor-core matmul is larger; scalar work shrinks to a small fraction of runtime.</p></article>
+            <article><p class="tiny-label">02 / blocks</p><h3>Parallelize one long head</h3><p>For small batch × head counts, assigning one block to a row range can leave the GPU under-occupied. FA-2 adds sequence-length parallelism.</p></article>
+            <article><p class="tiny-label">03 / warps</p><h3>Use sliced-Q work</h3><p>Warps own different query slices while sharing K/V. Their output slices are independent, avoiding reductions through shared memory used by the sliced-K style.</p></article>
+          </div>
+
+          <div class="widget work-widget" id="work-map" data-widget="work-map">
+            <div class="widget-heading"><div><p class="tiny-label">Scheduling model</p><h3>FA-1 vs FA-2 work partition</h3></div><p>Compare how each version of the kernel divides work across four warps in one thread block. This is a learning diagram, not a profiler trace.</p></div>
+            <div class="segmented" role="group" aria-label="Choose work map"><button type="button" class="selected" data-work-mode="fa1" aria-pressed="true">FA-1 · sliced-K</button><button type="button" data-work-mode="fa2" aria-pressed="false">FA-2 · sliced-Q</button></div>
+            <div class="work-grid">
+              <div class="work-axis work-axis-q" aria-hidden="true">
+                <p class="tiny-label">query rows</p>
+                <div class="work-axis-cells" id="work-axis-q">Q<sub>0</sub> · Q<sub>1</sub> · Q<sub>2</sub> · Q<sub>3</sub></div>
+              </div>
+              <div class="work-axis work-axis-k" aria-hidden="true">
+                <p class="tiny-label">K/V tiles</p>
+                <div class="work-axis-cells" id="work-axis-k">K<sub>0</sub> · K<sub>1</sub> · K<sub>2</sub> · K<sub>3</sub></div>
+              </div>
+              <div class="work-diagram" id="work-diagram" aria-live="polite"></div>
+            </div>
+            <div class="io-stats work-stats">
+              <div><p class="tiny-label">output ownership</p><strong id="work-output-stat">partial per warp</strong><p class="io-formula">FA-1: warps each emit a partial output; reduction across warps is required.</p></div>
+              <div><p class="tiny-label">shared memory</p><strong id="work-shared-stat">one K/V tile</strong><p class="io-formula">FA-1: warps stream distinct K/V tiles independently.</p></div>
+              <div><p class="tiny-label">cross-warp traffic</p><strong id="work-traffic-stat">yes</strong><p class="io-formula">FA-1: shared-memory reduction after each block.</p></div>
+            </div>
+            <p class="widget-status" id="work-status" aria-live="polite">FA-1 slices divide K/V work; partial outputs need a cross-warp reduction.</p>
+          </div>
+        </section>
+
+        <section class="section chapter" id="kernel" aria-labelledby="kernel-title">
+          <div class="chapter-index">05</div>
+          <div class="chapter-heading"><p class="eyebrow">Kernel &amp; backward</p><h2 id="kernel-title">What the kernel owns, and how gradients flow back.</h2></div>
+          <div class="kernel-map">
+            <article><span class="kernel-number">A</span><h3>Thread block</h3><p>Loads one K/V tile, takes a Q tile or slice, and keeps block-local intermediate state on chip.</p></article>
+            <article><span class="kernel-number">B</span><h3>Warp</h3><p>A group of 32 CUDA threads. FA-2 gives warps independent Q output slices, reducing synchronization and shared-memory exchange.</p></article>
+            <article><span class="kernel-number">C</span><h3>Tensor cores</h3><p>Specialized matrix-multiply hardware accelerates the QK<sup>T</sup> and PV-shaped products. Shape and datatype affect how effectively they are used.</p></article>
+            <article><span class="kernel-number">D</span><h3>Registers + shared memory</h3><p>Hold fragments, scores, softmax statistics, and tiles just long enough to avoid round-trips to HBM.</p></article>
+          </div>
+
+          <div class="prose-grid" style="margin-top: 2rem;">
+            <div>
+              <h3>The forward pass, step by step</h3>
+              <p>For one query block <span class="math-inline">Q<sub>r</sub> ∈ ℝ<sup>B<sub>r</sub>×d</sup></span> and the stream of K/V blocks <span class="math-inline">(K<sub>c</sub><sup>(j)</sup>, V<sub>c</sub><sup>(j)</sup>) ∈ ℝ<sup>B<sub>c</sub>×d</sup></span>:</p>
+              <ol>
+                <li><strong>Load Q tile</strong>: each thread block loads <span class="math-inline">Q<sub>r</sub></span> from HBM into shared memory.</li>
+                <li><strong>Loop over K/V tiles</strong>. For each <span class="math-inline">j</span>:
+                  <ul>
+                    <li>Load <span class="math-inline">K<sub>c</sub><sup>(j)</sup></span> and <span class="math-inline">V<sub>c</sub><sup>(j)</sup></span> into shared memory.</li>
+                    <li>Compute <span class="math-inline">S<sub>r,c</sub> = Q<sub>r</sub> K<sub>c</sub><sup>(j)T</sup> / √d</span> using tensor cores.</li>
+                    <li>Apply the mask: <span class="math-inline">S<sub>ij</sub> ← S<sub>ij</sub> + M<sub>ij</sub></span> (where <span class="math-inline">M<sub>ij</sub> ∈ {0, −∞}</span>).</li>
+                    <li>Update the running maximum: <span class="math-inline">m′ = max(m, max<sub>c</sub> S<sub>r,c</sub>)</span>; rescale the old <span class="math-inline">o</span> and <span class="math-inline">ℓ</span> by <span class="math-inline">e<sup>m − m′</sup></span>.</li>
+                    <li>Compute <span class="math-inline">P<sub>r,c</sub> = exp(S<sub>r,c</sub> − m′)</span>; update <span class="math-inline">ℓ ← e<sup>m − m′</sup> ℓ + Σ<sub>c</sub> P<sub>r,c</sub></span>.</li>
+                    <li>Accumulate the output: <span class="math-inline">o ← e<sup>m − m′</sup> o + P<sub>r,c</sub> V<sub>c</sub><sup>(j)</sup></span>.</li>
+                  </ul>
+                </li>
+                <li><strong>Final normalization</strong>: <span class="math-inline">O<sub>r</sub> = o / ℓ</span>; write <span class="math-inline">O<sub>r</sub></span> and the per-row log-normalizer <span class="math-inline">L = m + log ℓ</span> to HBM for backward.</li>
+              </ol>
+
+              <p class="math-block" aria-label="Forward pass pseudo-code">
+                <span class="label">algorithm · forward pass, one Q-block</span>
+                <pre><code>init:   m = −∞,  ℓ = 0,  o = 0
+for each K_c, V_c block j:
+    S = Q_r · K_c^T / √d
+    S += M                                  # causal mask
+    m_new  = rowwise_max(m, S)
+    P      = exp(S − m_new)                  # all ≤ 0
+    ℓ      = exp(m − m_new) · ℓ + rowsum(P)
+    o      = exp(m − m_new) · o + P · V_c
+    m      = m_new
+O_r = o / ℓ                                  # write to HBM</code></pre>
+              </p>
+
+              <h3>The backward pass</h3>
+              <p>The backward pass computes <span class="math-inline">∂L/∂Q, ∂L/∂K, ∂L/∂V</span> from <span class="math-inline">∂L/∂O</span>. The chain rule gives three identities:</p>
+
+              <h3>Backpropagation in plain language</h3>
+              <p>Suppose the loss says that output row <span class="math-inline">O<sub>i</sub></span> should have moved in some direction. That signal first asks which value rows contributed to <span class="math-inline">O<sub>i</sub></span>: those contributions form <span class="math-inline">∂L/∂V</span>. It then asks which attention weights made the mixture too large or too small: that is the signal through <span class="math-inline">P</span> and its row-wise softmax. Finally, it asks which query–key dot products created those weights. That produces <span class="math-inline">∂L/∂Q</span> and <span class="math-inline">∂L/∂K</span>.</p>
+              <p>The important systems point is that this explanation only needs a score tile and its local softmax at one time. Once a backward tile has regenerated its scores from the resident Q/K/V tiles and the saved log-normalizer, it can accumulate the corresponding slices of <span class="math-inline">∂Q</span>, <span class="math-inline">∂K</span>, and <span class="math-inline">∂V</span>, then discard the tile. The full probability matrix is a convenient algebraic picture, not a storage requirement.</p>
+
+              <p class="math-block" aria-label="Backward pass chain rule">
+                <span class="label">definition · gradient of attention</span>
+                <div class="math-row"><span class="tag">∂L/∂V</span><span>=</span><span>P<sup>T</sup> · (∂L/∂O)</span></div>
+                <div class="math-row"><span class="tag">∂L/∂S</span><span>=</span><span>P ⊙ ( (∂L/∂O) · V<sup>T</sup> − rowsum( (∂L/∂O) ⊙ O ) ⊙ 1<sup>T</sup> P )</span></div>
+                <div class="math-row"><span class="tag">∂L/∂Q</span><span>=</span><span>(∂L/∂S) · K / √d</span></div>
+                <div class="math-row"><span class="tag">∂L/∂K</span><span>=</span><span>(∂L/∂S)<sup>T</sup> · Q / √d</span></div>
+                <div class="math-row"><span class="tag"></span><span class="math-cond">where ⊙ is element-wise multiplication, and the rowsum term is the softmax Jacobian.</span></div>
+              </p>
+
+              <p>The problem: these formulas all depend on the <span class="math-inline">N × N</span> probability matrix <span class="math-inline">P</span>. Storing <span class="math-inline">P</span> for <span class="math-inline">N = 65 536</span> needs ~16 GB per head — prohibitive. FlashAttention does <strong>not</strong> save <span class="math-inline">P</span>; it recomputes the per-tile softmax during backward, using the saved row-wise <span class="math-inline">L = m + log ℓ</span> from forward to recover stable normalization.</p>
+
+              <p class="math-block lemma compact" aria-label="Recomputation cost">
+                <span class="label green">cost · recomputation vs storage</span>
+                <div class="math-row"><span class="tag">storage</span><span>O(N²)</span><span class="math-cond">· HBM traffic, dominant at large N</span></div>
+                <div class="math-row"><span class="tag">recompute</span><span>O(N²d)</span><span class="math-cond">· FLOPs, dominated by cheap tensor-core matmuls</span></div>
+              </p>
+
+              <p>The trade is favorable when the kernel is memory-bound, which is exactly the regime where attention is the bottleneck. The FLOP overhead of recomputation is roughly 33% more FLOPs than a saved-probabilities backward, but the HBM savings are <span class="math-inline">Θ(N²)</span> bytes eliminated per layer per step.</p>
+
+              <h3>Causal structure halves the FLOPs</h3>
+              <p>For causal attention, the upper triangle of <span class="math-inline">S</span> is masked to <span class="math-inline">−∞</span> before softmax and therefore contributes zero. The kernel exploits this by skipping the upper triangle: only the lower triangle is computed, halving the FLOPs of the <span class="math-inline">Q K<sup>T</sup></span> matmul. The gradient <span class="math-inline">∂L/∂S</span> inherits the same structure, so the same skip applies on the backward pass.</p>
+
+              <h3>Block-diagonal gradient structure</h3>
+              <p>The gradient with respect to the score matrix is <em>not</em> block-diagonal in general, but for causal attention it inherits the lower-triangular sparsity. The block-level accumulation pattern is the mirror of the forward: forward accumulates <span class="math-inline">O</span>; backward accumulates <span class="math-inline">∂L/∂Q, ∂L/∂K, ∂L/∂V</span>. Each block writes once to HBM after the inner loop finishes, so the inner accumulation lives in shared memory.</p>
+            </div>
+            <aside class="callout"><p class="tiny-label">Checkpointing trade-off</p><p>Standard PyTorch attention saves the <span class="math-inline">N × N</span> probability matrix for backward, costing <span class="math-inline">Θ(N²)</span> memory. FlashAttention recomputes it from Q, K, V in <span class="math-inline">Θ(Nd)</span> memory. For <span class="math-inline">N = 65 536, d = 128</span>: saving probabilities needs 16 GB; recomputation needs ~100 MB. The FLOP overhead is ~30%, but the memory savings enable much longer sequences.</p></aside>
+          </div>
+
+          <div class="two-col-notes">
+            <article><h3>Masking &amp; dropout</h3><p>Causal masks can skip entire tile regions. Attention dropout must reproduce the same mask during backward, so implementations use deterministic random-number bookkeeping (a per-row seed) rather than storing every probability.</p></article>
+            <article><h3>Backward pass</h3><p>The backward pass does not need a saved <span class="math-inline">N × N</span> probability matrix. It recomputes blockwise quantities from Q, K, V, the output gradient, and the saved per-row log-normalizer <span class="math-inline">L = m + log ℓ</span> from the forward pass. Extra compute, dramatically less HBM traffic.</p></article>
+          </div>
+
+          <div class="widget" id="backward-viz" data-widget="backward">
+            <div class="widget-heading"><div><p class="tiny-label">Backward pass visualization</p><h3>Gradient flow through attention</h3></div><p>Step through the eight operations that take the output gradient <span class="math-inline">∂L/∂O</span> back to <span class="math-inline">∂L/∂Q, ∂L/∂K, ∂L/∂V</span>. The kernel recomputes the softmax locally rather than persisting <span class="math-inline">P</span>.</p></div>
+            <div class="pipeline" id="backward-flow" aria-live="polite"></div>
+            <div class="state-flow state-flow-compact">
+              <div><span>step</span><strong id="backward-step">—</strong></div>
+              <div><span>compute</span><strong id="backward-compute">—</strong></div>
+              <div><span>memory</span><strong id="backward-memory">—</strong></div>
+              <div><span>gradient</span><strong id="backward-gradient">—</strong></div>
+              <div><span>accumulate</span><strong id="backward-accumulate">—</strong></div>
+            </div>
+            <div class="widget-actions">
+              <button type="button" id="backward-step-btn">Step</button>
+              <button type="button" id="backward-play-btn">Play</button>
+              <button type="button" id="backward-reset-btn">Reset</button>
+            </div>
+            <p class="widget-status" id="backward-status" aria-live="polite">The backward pass recomputes P from Q, K, V, then applies the chain rule to get gradients.</p>
+          </div>
+        </section>
+
+        <section class="section chapter" id="extensions" aria-labelledby="extensions-title">
+          <div class="chapter-index">06</div>
+          <div class="chapter-heading"><p class="eyebrow">Beyond the basics</p><h2 id="extensions-title">Extensions and variants.</h2></div>
+          <div class="prose-grid">
+            <div>
+              <div class="tag-row"><span>sparse</span><span>paged</span><span>FP8</span><span>ring</span><span>context</span></div>
+              <h3>Block-sparse attention</h3>
+              <p>FlashAttention can skip blocks that the mask marks as irrelevant. For causal attention, the upper-triangular blocks are never computed. For sparse patterns (e.g. Longformer’s sliding window plus a few global tokens), the kernel loads only the non-zero blocks. The online softmax state still accumulates correctly: missing blocks simply contribute zero. The result is <em>not</em> the same mathematical operation as dense attention — it is a masked variant that is exact for that mask.</p>
+
+              <h3>Multi-query and grouped-query attention</h3>
+              <p>In multi-query attention (MQA), all query heads share one K/V head. In grouped-query attention (GQA), groups of query heads share a K/V head. FlashAttention-2 handles both by loading each K/V tile once and reusing it across multiple Q tiles. The K/V cache bandwidth at inference drops by a factor equal to the number of queries sharing each K/V head (often 4–8 in modern LLMs).</p>
+
+              <p class="math-block compact" aria-label="GQA bandwidth reduction">
+                <span class="label">reduction · K/V cache bandwidth</span>
+                <span class="math-frac"><span class="num">bandwidth(GQA-g)</span><span class="den">bandwidth(MHA)</span></span> <span class="math-eq">=</span> <span class="math-frac"><span class="num">1</span><span class="den">g</span></span> &nbsp;&nbsp;,
+                <span class="math-cond">where g = number of query heads per K/V head</span>
+              </p>
+
+              <h3>Paged attention (vLLM)</h3>
+              <p>For autoregressive inference, the KV cache grows with sequence length. vLLM organizes the cache into fixed-size pages and uses a page table to map logical token positions to physical pages. FlashAttention can operate on non-contiguous K/V pages by gathering tiles through the page table, enabling memory-efficient batching of sequences with different lengths.</p>
+
+              <h3>FP8 / double quantization</h3>
+              <p>FlashAttention-3 adds native FP8 support: Q, K, V are quantized to FP8 before the matmul, and the inner accumulation stays in higher precision. The tiling strategy is unchanged; only the load/store and matmul dtypes shift. Quantization error is typically small compared to the softmax’s numerical-stability margin (a few ULPs).</p>
+
+              <h3>Ring attention for sequence parallelism</h3>
+              <p>When a single GPU cannot hold the full sequence, ring attention partitions the sequence across multiple GPUs. Each GPU holds a shard of Q, K, V and communicates in a ring topology. The algorithm: each GPU computes local <span class="math-inline">Q K<sup>T</sup></span>, then passes K, V to the next GPU while receiving from the previous. After <span class="math-inline">G − 1</span> steps (for <span class="math-inline">G</span> GPUs), every GPU has seen all K/V tiles. The online softmax state merges across GPUs identically to the single-GPU case — the merge rule is associative, so ring reduction is just a distributed instance of the same operation.</p>
+
+              <h3>Context parallelism (CP)</h3>
+              <p>For ultra-long contexts (1M+ tokens), context parallelism splits the sequence across GPUs at the token level. Unlike tensor parallelism (which splits within a layer), CP splits <em>across</em> the sequence dimension. Each GPU runs a FlashAttention kernel on its local shard, then all-reduces the softmax statistics <span class="math-inline">(m, ℓ, o)</span>. Recent work achieves near-linear scaling to 1024 GPUs for 10M-token sequences.</p>
+            </div>
+            <aside class="callout"><p class="tiny-label">Research frontier</p><ul>
+              <li><strong>FlashDecoding</strong>: further parallelizes the reduction across warps for inference.</li>
+              <li><strong>PagedFlashAttention</strong>: integrates with paged KV caches for serving.</li>
+              <li><strong>FlashAttention-3</strong>: FP8, async TMA copies, warp-specialization for H100.</li>
+              <li><strong>Triton implementations</strong>: high-level kernels approaching hand-written CUDA performance.</li>
+              <li><strong>HiP attention</strong>: hierarchical paging for trillion-token contexts.</li>
+              <li><strong>Minference</strong>: dynamic sparse patterns that adapt to attention heads.</li>
+            </ul></aside>
+          </div>
+
+          <div class="widget" id="speedup-calc" data-widget="speedup">
+            <div class="widget-heading"><div><p class="tiny-label">Performance estimator</p><h3>Speedup vs naive attention</h3></div><p>Drag the sliders. The bar shows the speedup of FlashAttention-2 over a triple-pass reference at the chosen shape; the marker at <span class="math-inline">1×</span> is the baseline.</p></div>
+            <div class="io-controls speedup-controls">
+              <div class="io-control">
+                <label for="speedup-n-input">Sequence length <span class="math-inline">N</span> <output id="speedup-n">4 096</output></label>
+                <input id="speedup-n-input" type="range" min="256" max="131072" step="256" value="4096">
+              </div>
+              <div class="io-control">
+                <label for="speedup-b-input">Batch × heads <output id="speedup-b">64</output></label>
+                <input id="speedup-b-input" type="range" min="1" max="1024" step="1" value="64">
+              </div>
+            </div>
+            <div class="speedup-bar-wrap">
+              <div class="speedup-bar" id="speedup-bar" aria-hidden="true">
+                <span class="speedup-bar-baseline" aria-hidden="true"></span>
+                <span class="speedup-bar-fill" id="speedup-bar-fill"></span>
+                <span class="speedup-bar-marker" id="speedup-bar-marker">—</span>
+              </div>
+              <div class="speedup-bar-axis" aria-hidden="true">
+                <span>0×</span><span>1× baseline</span><span>2×</span><span>3×</span><span>4×</span><span>5×</span><span>6×</span>
+              </div>
+            </div>
+            <div class="widget-actions">
+              <button type="button" id="speedup-short">Short (512)</button>
+              <button type="button" id="speedup-medium">Medium (2K)</button>
+              <button type="button" id="speedup-long">Long (8K)</button>
+              <button type="button" id="speedup-ultra">Ultra (32K)</button>
+            </div>
+            <div class="io-stats speedup-stats">
+              <div><p class="tiny-label">estimated speedup</p><strong id="speedup-result">2.3×</strong><p class="io-formula">FA-2 / naive at this N, B, d = 128, BF16</p></div>
+              <div><p class="tiny-label">regime</p><strong id="speedup-regime">memory-bound</strong><p class="io-formula">where the IO lower bound from chapter 08 pays off</p></div>
+              <div><p class="tiny-label">HBM reduction</p><strong id="speedup-hbm">≈ 32×</strong><p class="io-formula">naive bytes / FA-2 bytes at this N</p></div>
+            </div>
+            <p class="widget-status" id="speedup-status" aria-live="polite">Speedup estimates assume A100 GPU, BF16, causal attention. Actual performance varies with head dimension and memory bandwidth.</p>
+          </div>
+        </section>
+
+        <section class="section chapter" id="comparison" aria-labelledby="comparison-title">
+          <div class="chapter-index">07</div>
+          <div class="chapter-heading"><p class="eyebrow">Landscape</p><h2 id="comparison-title">Attention variants compared.</h2></div>
+
+          <div class="widget" id="attention-compare" data-widget="compare">
+            <div class="widget-heading"><div><p class="tiny-label">Interactive comparison</p><h3>Attention variants by sequence length</h3></div><p>Pick a sequence-length regime. The bars compare the speedup each variant achieves against the naive triple-pass reference, and a recommendation badge picks the best one for that shape.</p></div>
+            <div class="segmented" role="group" aria-label="Choose sequence length">
+              <button type="button" data-compare-mode="short" aria-pressed="false">Short (512)</button>
+              <button type="button" data-compare-mode="medium" aria-pressed="true">Medium (4K)</button>
+              <button type="button" data-compare-mode="long" aria-pressed="false">Long (16K)</button>
+              <button type="button" data-compare-mode="extreme" aria-pressed="false">Extreme (128K)</button>
+            </div>
+            <div class="compare-bars" id="compare-results" role="list" aria-live="polite"></div>
+            <div class="io-stats compare-stats">
+              <div><p class="tiny-label">recommendation</p><strong id="compare-pick">FlashAttention-2</strong><p class="io-formula">best speedup for this sequence length</p></div>
+              <div><p class="tiny-label">memory</p><strong id="compare-memory">Low</strong><p class="io-formula">peak HBM footprint for the recommended variant</p></div>
+              <div><p class="tiny-label">exactness</p><strong id="compare-exact">Yes</strong><p class="io-formula">does the recommended variant match the math exactly?</p></div>
+            </div>
+            <p class="widget-status" id="compare-status" aria-live="polite">Medium sequences: FlashAttention-2 balances memory savings with compute efficiency.</p>
+          </div>
+
+          <div class="two-col-notes" style="margin-top: 2rem;">
+            <article>
+              <h3>When to use what</h3>
+              <ul>
+                <li><strong>CuDNN attention</strong>: short sequences (<span class="math-inline">N ≤ 384</span>), large batches. Optimized for the compute-bound regime.</li>
+                <li><strong>FlashAttention-2</strong>: medium to long sequences (<span class="math-inline">N ≥ 1K</span>), any batch size. The all-rounder.</li>
+                <li><strong>FlashDecoding</strong>: inference with KV cache. Further optimizes the decode phase.</li>
+                <li><strong>Sparse attention</strong>: very long sequences (<span class="math-inline">N ≥ 16K</span>) where full attention is unnecessary.</li>
+                <li><strong>Linear attention</strong>: extreme sequences (<span class="math-inline">N ≥ 128K</span>) where even FA-2 is too slow; accepts approximation.</li>
+              </ul>
+            </article>
+            <article>
+              <h3>Trade-offs</h3>
+              <ul>
+                <li><strong>Exact vs approximate</strong>: FlashAttention is exact; linear attention (Performer, RetNet) approximates.</li>
+                <li><strong>Memory vs compute</strong>: sparse attention saves memory but may lose accuracy; FA-2 saves memory exactly.</li>
+                <li><strong>Training vs inference</strong>: FlashDecoding optimizes for autoregressive decode; FA-2 optimizes for prefill.</li>
+                <li><strong>Single-GPU vs multi-GPU</strong>: ring attention and context parallelism scale beyond single-GPU memory.</li>
+              </ul>
+            </article>
+          </div>
+        </section>
+
+        <section class="section chapter" id="foundations" aria-labelledby="foundations-title">
+          <div class="chapter-index">08</div>
+          <div class="chapter-heading"><p class="eyebrow">Mathematical foundations</p><h2 id="foundations-title">Why the math works.</h2></div>
+
+          <p>Every claim the chapters make reduces to a small number of statements. This chapter proves them in one place, in the order a careful reader needs: softmax is invariant under translation; the merge of two online-softmax states is associative; the IO lower bound matches what FlashAttention achieves; the recomputation strategy is FLOP-cheap and memory-free; and the kernel’s claimed exactness is correct under standard floating-point assumptions.</p>
+
+          <div class="lemma-box">
+            <p class="lemma-name">theorem · translation invariance of softmax</p>
+            <p>For any vector <span class="math-inline">x ∈ ℝ<sup>n</sup></span> and any scalar <span class="math-inline">c ∈ ℝ</span>,
+            <span class="math-inline">softmax(x + c · 1) = softmax(x)</span>.</p>
+            <p class="proof">
+              <span class="math-frac"><span class="num">exp(x<sub>i</sub> + c)</span><span class="den">Σ<sub>j</sub> exp(x<sub>j</sub> + c)</span></span>
+              <span class="math-eq">=</span>
+              <span class="math-frac"><span class="num">exp(x<sub>i</sub>) · exp(c)</span><span class="den">Σ<sub>j</sub> exp(x<sub>j</sub>) · exp(c)</span></span>
+              <span class="math-eq">=</span>
+              <span class="math-frac"><span class="num">exp(x<sub>i</sub>)</span><span class="den">Σ<sub>j</sub> exp(x<sub>j</sub>)</span></span>
+              <span class="proof-qed">∎</span>
+            </p>
+            <p>The factor <span class="math-inline">exp(c)</span> cancels in numerator and denominator. Subtracting the running maximum is therefore a free degree of freedom that the algorithm can use to keep all exponents in <span class="math-inline">(−∞, 0]</span>.</p>
+          </div>
+
+          <div class="lemma-box">
+            <p class="lemma-name">theorem · associativity of online state merging</p>
+            <p>Let <span class="math-inline">(m<sub>a</sub>, ℓ<sub>a</sub>, o<sub>a</sub>)</span> and <span class="math-inline">(m<sub>b</sub>, ℓ<sub>b</sub>, o<sub>b</sub>)</span> be online-softmax states from disjoint score sets. Define the merge as in chapter 03, with
+            <span class="math-inline">m = max(m<sub>a</sub>, m<sub>b</sub>)</span>,
+            <span class="math-inline">ℓ = e<sup>m<sub>a</sub> − m</sup> ℓ<sub>a</sub> + e<sup>m<sub>b</sub> − m</sup> ℓ<sub>b</sub></span>, and
+            <span class="math-inline">o = e<sup>m<sub>a</sub> − m</sup> o<sub>a</sub> + e<sup>m<sub>b</sub> − m</sup> o<sub>b</sub></span>. Then the merge is associative: merging <span class="math-inline">A</span> and <span class="math-inline">B</span>, then <span class="math-inline">C</span>, equals merging <span class="math-inline">A</span> with the merge of <span class="math-inline">B</span> and <span class="math-inline">C</span>.</p>
+            <p class="proof">
+              Each merge normalizes both inputs to the same reference maximum <span class="math-inline">m</span>, sums the normalized contributions, and emits a new maximum. Composition of two such merges is again of the same form: the final state has the correct maximum (the max of all inputs) and the correct total normalizer and numerator, by linearity of the rescaled sum. The order of additions is independent of the merge order. <span class="proof-qed">∎</span>
+            </p>
+            <p>Consequence: the result of streaming softmax over a row does not depend on the order in which tiles are processed, the number of warps, the number of blocks, or the number of GPUs. FlashAttention’s correctness under all of FA-1, FA-2, sequence parallelism, ring attention, and context parallelism follows from this single statement.</p>
+          </div>
+
+          <div class="lemma-box">
+            <p class="lemma-name">theorem · IO lower bound and FlashAttention’s optimality</p>
+            <p>Any correct attention algorithm that reads Q, K, V from HBM and writes O to HBM performs at least <span class="math-inline">Ω(N²d / M)</span> HBM accesses, where <span class="math-inline">M</span> is the on-chip memory capacity. FlashAttention matches this bound to within a constant for <span class="math-inline">d ≤ M / B</span>.</p>
+            <p class="proof">
+              The total useful output is <span class="math-inline">Nd</span> elements; the total useful input is <span class="math-inline">3Nd</span>. Any kernel that does not persist the <span class="math-inline">N × N</span> intermediate must, by the time the last row of O is written, have read each row of K and V that contributes to it. The IO cost of streaming K and V is <span class="math-inline">2Nd</span>; the cost of streaming Q is <span class="math-inline">Nd</span>; the cost of writing O is <span class="math-inline">Nd</span>. The lower bound is therefore <span class="math-inline">Ω(Nd)</span> in the ideal case. With finite on-chip memory <span class="math-inline">M</span>, each tile of size <span class="math-inline">B</span> must be loaded and reused; the number of reuses is <span class="math-inline">N/B</span>, giving the classical <span class="math-inline">Ω(N²d / M)</span>. FlashAttention loads Q once, streams K/V in <span class="math-inline">N/B</span> tiles per row, and produces O in one pass — exactly the bound. <span class="proof-qed">∎</span>
+            </p>
+            <p>No algorithm can reduce HBM traffic below this without changing the mathematical operation (e.g. sparse, low-rank, or linear attention). That is what “exact” means in the name.</p>
+          </div>
+
+          <div class="lemma-box">
+            <p class="lemma-name">theorem · recomputation is a free trade at long N</p>
+            <p>Forward attention costs <span class="math-inline">2N²d</span> FLOPs. Backward attention with saved probabilities costs <span class="math-inline">4N²d</span>. Backward with recomputation costs <span class="math-inline">6N²d</span>. The 50% extra FLOPs are negligible compared to the HBM traffic saved: <span class="math-inline">Θ(N²)</span> bytes of probability storage eliminated per layer per step.</p>
+            <p class="proof">
+              Standard backward needs <span class="math-inline">3N²d</span> matmul FLOPs (the three gradient terms) plus pointwise ops; saved probabilities turn the <span class="math-inline">∂L/∂S</span> computation into a pointwise op. Recomputation re-runs the forward softmax in <span class="math-inline">Θ(N²d)</span> FLOPs and the matmuls are then identical. The <span class="math-inline">+2N²d</span> extra FLOPs are dominated by the <span class="math-inline">N²</span> HBM savings in the memory-bound regime. <span class="proof-qed">∎</span>
+            </p>
+            <p>General checkpointing trades memory for the same reason; FlashAttention is a <em>specialized</em> checkpoint that knows the attention structure and reuses on-chip state across the recompute.</p>
+          </div>
+
+          <div class="lemma-box">
+            <p class="lemma-name">lemma · numerical stability under rescaling</p>
+            <p>For any sequence of running maxima <span class="math-inline">m<sub>(1)</sub>, m<sub>(2)</sub>, …, m<sub>(k)</sub></span> with <span class="math-inline">m<sub>(i+1)</sub> ≥ m<sub>(i)</sub></span> for some subsequence, the cumulative rescale factor after <span class="math-inline">k</span> updates lies in <span class="math-inline">(0, 1]</span>, so the accumulator cannot overflow.</p>
+            <p class="proof">
+              Each rescale is <span class="math-inline">exp(−Δm)</span> with <span class="math-inline">Δm ≥ 0</span>, hence in <span class="math-inline">(0, 1]</span>. A product of numbers in <span class="math-inline">(0, 1]</span> stays in <span class="math-inline">(0, 1]</span>. The running normalizer <span class="math-inline">ℓ</span> is a sum of non-negative terms scaled by <span class="math-inline">(0, 1]</span> factors; with max-subtraction every term lies in <span class="math-inline">(0, 1]</span>, so <span class="math-inline">ℓ ∈ (0, B<sub>c</sub>]</span>. The numerator <span class="math-inline">o</span> is the same rescaled sum against value vectors, bounded by the value magnitude times the row sum. <span class="proof-qed">∎</span>
+            </p>
+          </div>
+
+          <h3>The complete correctness sketch</h3>
+          <p>Putting the four theorems together: the online softmax state is well-defined at every step (translation invariance), the merge is associative (so reductions compose), the recomputation strategy is FLOP-cheap (so backward is not a bottleneck), and the rescaling never overflows (so numerics stay clean). The kernel implements the merge in shared memory, parallelizes it across warps and blocks via associativity, and respects the IO lower bound by streaming tiles. That is the proof of FlashAttention.</p>
+
+          <h3>What FlashAttention is not</h3>
+          <p>It is not a sparse method (no scores are dropped). It is not low-rank (no projections of the score matrix are taken). It is not linear attention (the softmax is exact, not a feature map). It is not FlashAttention-3 (no FP8, no TMA, no warp specialization; those are separate techniques). The exact tile sizes, the warp work assignment, and the BF16 path are implementation details of the paper, not the algorithm.</p>
+
+          <div class="math-block" aria-label="Summary of correctness">
+            <span class="label">summary · four claims, one principle</span>
+            <div class="math-row"><span class="tag">1</span><span>softmax(x + c · 1) = softmax(x)</span><span class="math-cond">· translation invariance</span></div>
+            <div class="math-row"><span class="tag">2</span><span>merge of (m, ℓ, o) is associative</span><span class="math-cond">· arbitrary reduction order</span></div>
+            <div class="math-row"><span class="tag">3</span><span>HBM traffic = Θ(N²d / M) = lower bound</span><span class="math-cond">· IO-optimal</span></div>
+            <div class="math-row"><span class="tag">4</span><span>recompute is Θ(N²d) FLOPs, saves Θ(N²) HBM</span><span class="math-cond">· backward is free at long N</span></div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <footer><p>FlashAttention-2 field guide · designed to be read locally, inspected freely, and verified with small exact examples.</p></footer>
+    <script type="module" src="app.js?v=8"></script>
+  </body>
+</html>

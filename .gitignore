@@ -1,0 +1,8 @@
+# Dev tooling / local agent state — never publish
+.DS_Store
+.remember/
+.codebase-memory/
+docs/superpowers/
+
+# macOS
+*.DS_Store

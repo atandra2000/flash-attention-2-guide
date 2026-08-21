@@ -1,0 +1,19 @@
+{
+  "name": "flash-attention-2-guide",
+  "version": "1.0.0",
+  "description": "FlashAttention-2 — an exact attention field guide. Static, dependency-free HTML/CSS/JS teaching site.",
+  "type": "module",
+  "scripts": {
+    "test": "node test-guide.mjs",
+    "serve": "python3 -m http.server 8137"
+  },
+  "keywords": [
+    "flash-attention",
+    "transformer-attention",
+    "online-softmax",
+    "gpu-kernels",
+    "deep-learning"
+  ],
+  "license": "MIT",
+  "private": true
+}
