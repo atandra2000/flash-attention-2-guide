@@ -4,7 +4,9 @@
   "description": "FlashAttention-2 — an exact attention field guide. Static, dependency-free HTML/CSS/JS teaching site.",
   "type": "module",
   "scripts": {
-    "test": "node test-guide.mjs",
+    "test": "node test-guide.mjs && node test-browser.mjs",
+    "test:static": "node test-guide.mjs",
+    "test:browser": "node test-browser.mjs",
     "serve": "python3 -m http.server 8137"
   },
   "keywords": [

@@ -44,21 +44,34 @@ or `npm run serve`.
 
 ## Tests
 
-Static checks (structure, accessibility fallbacks, and the math helpers
-extracted from `app.js` — softmax stability, streaming-vs-reference
-attention parity, IO-byte formulas, speedup bounds):
-
 ```bash
-npm test        # node test-guide.mjs
+npm test             # static + math checks, then the browser checks
+npm run test:static  # node test-guide.mjs  (no browser needed)
+npm run test:browser # node test-browser.mjs (real headless Chromium)
 ```
+
+`test-guide.mjs` reads the source files as text. It checks the chapter
+structure, the accessibility affordances, and the math helpers exported from
+`app.js`: softmax stability, streaming-versus-reference attention parity, the
+IO-byte formulas, and the speedup bounds.
+
+`test-browser.mjs` runs the real page in a real headless Chromium and drives
+the widgets: clicking every control, arrow-key and space-bar playback, the
+timers, scrolling the progress rail, `localStorage` resume, computed styles
+under `prefers-reduced-motion`, and the network log. It speaks the Chrome
+DevTools Protocol over Node's built-in `WebSocket`, so it needs no packages.
+The browser comes from `$CHROME_PATH` or the usual install locations; with no
+browser present it prints `SKIP` and exits 0, so the static checks stay the
+hard gate.
 
 ## Repo layout
 
 ```
-index.html      # the guide (single page, 8 chapters)
-styles.css      # theme + responsive layout
-app.js          # widgets + math (ES module, exports tested helpers)
-test-guide.mjs  # static + math checks (node:test-style asserts)
+index.html        # the guide (single page, 8 chapters)
+styles.css        # theme + responsive layout
+app.js            # widgets + math (ES module, exports tested helpers)
+test-guide.mjs    # static + math checks
+test-browser.mjs  # browser behaviour checks, no dependencies
 ```
 
 ## License

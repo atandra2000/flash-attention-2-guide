@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="A mathematical, systems, and theoretical field guide to exact FlashAttention-2.">
     <title>FlashAttention-2 — an exact attention field guide</title>
+    <!-- Inline icon: the tab mark without adding a file or a request. -->
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230E1115'/%3E%3Ctext x='16' y='24' font-family='monospace' font-size='23' font-weight='700' fill='%23C8553D' text-anchor='middle'%3E2%3C/text%3E%3C/svg%3E">
     <link rel="stylesheet" href="styles.css?v=8">
   </head>
   <body>
@@ -120,7 +122,7 @@
             <div class="io-stats attention-stats">
               <div><p class="tiny-label"><span class="math-inline">S = QK<sup>T</sup> / √d</span></p><strong id="att-stage1">[[0.707, 0, 0.707], [0, 0.707, 0.707]]</strong><p class="io-formula">N × N scores</p></div>
               <div><p class="tiny-label"><span class="math-inline">P = softmax(S)</span></p><strong id="att-stage2">[[0.401, 0.198, 0.401], [0.198, 0.401, 0.401]]</strong><p class="io-formula">rows sum to 1</p></div>
-              <div><p class="tiny-label"><span class="math-inline">O = PV</span></p><strong id="attention-output">[[3.401], [3.604]]</strong><p class="io-formula">N × d output</p></div>
+              <div><p class="tiny-label"><span class="math-inline">O = PV</span></p><strong id="attention-output">[[3.401],[3.604]]</strong><p class="io-formula">N × d output</p></div>
             </div>
             <p class="widget-status" id="attention-status" aria-live="polite">Step 1 of 3: scores. The next step subtracts each row's maximum, exponentiates, and normalizes; the final step multiplies the probabilities by V.</p>
           </div>

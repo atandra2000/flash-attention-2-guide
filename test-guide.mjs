@@ -20,7 +20,12 @@ for (const id of ["attention", "memory-wall", "online-softmax", "flash2", "kerne
 for (const id of ["attention-calc", "state-step", "tile-size", "work-map", "backward-flow", "state-old-scale", "state-new-mass", "state-merge-rule"]) {
   assert.match(html, new RegExp(`id=["']${id}["']`), `missing #${id}`);
 }
-assert.doesNotMatch(html, /https?:\/\//, "guide must not fetch remote assets");
+// An XML namespace is an identifier, not a fetch, so look past xmlns before
+// hunting for remote references.
+const withoutNamespaces = html.replace(/xmlns(:\w+)?=['"][^'"]*['"]/g, "");
+assert.doesNotMatch(withoutNamespaces, /https?:\/\//, "guide must not fetch remote assets");
+// The tab icon has to be inline, or the browser probes /favicon.ico and 404s.
+assert.match(html, /<link rel="icon" href="data:image\/svg\+xml,/, "favicon must be an inline data URI");
 for (const phrase of [
   "Scaled dot-product attention", "online softmax", "HBM", "shared memory",
   "exact", "sliced-Q", "MQA", "GQA", "Backward pass"
@@ -36,7 +41,17 @@ for (const id of ["rail-progress-text", "rail-progress-fill"]) {
   assert.match(html, new RegExp(`id=["']${id}["']`), `missing progress rail field: ${id}`);
 }
 assert.doesNotMatch(html, />loading</, "widgets must have readable static fallbacks");
-assert.match(html, /id=["']attention-output["'][^>]*>\[\[3\.401\], \[3\.604\]\]</, "attention fallback must match the demonstrated output");
+// The pre-rendered fallback must equal what app.js writes, or the page's own
+// text shifts once the module runs. Compare against the computed value rather
+// than a hand-typed literal so hand spacing can never drift again.
+const fallbackOutput = html.match(/id=["']attention-output["'][^>]*>([^<]*)</)[1].replace(/\s+/g, "");
+const demoQ = [[1, 0], [0, 1]];
+const demoK = [[1, 0], [0, 1], [1, 1]];
+const demoV = [[2], [3], [5]];
+const computedOutput = JSON.stringify(
+  standardAttention(demoQ, demoK, demoV).output.map(row => row.map(value => Number(value.toFixed(3)))),
+);
+assert.equal(fallbackOutput, computedOutput, "attention fallback must match the demonstrated output");
 assert.match(html, /id=["']state-play["'][^>]*aria-pressed=["']false["']/, "play control needs an initial state");
 assert.match(app, /play\.disabled = true/, "playback must prevent overlapping intervals");
 assert.match(app, /index = 0;\n    step\(\);/, "playback must show the first tile immediately");
@@ -51,11 +66,8 @@ for (const concept of ["Start one step earlier", "Follow one score tile’s life
 const probabilities = stableSoftmax([1000, 1001]);
 assert.ok(Math.abs(probabilities[0] + probabilities[1] - 1) < 1e-12, "softmax must normalize");
 assert.ok(probabilities[1] > probabilities[0], "stable softmax must preserve ordering");
-const q = [[1, 0], [0, 1]];
-const k = [[1, 0], [0, 1], [1, 1]];
-const v = [[2], [3], [5]];
-const reference = standardAttention(q, k, v).output;
-const streamed = streamingAttention(q, k, v, 2).output;
+const reference = standardAttention(demoQ, demoK, demoV).output;
+const streamed = streamingAttention(demoQ, demoK, demoV, 2).output;
 for (let i = 0; i < reference.length; i++) {
   assert.ok(Math.abs(reference[i][0] - streamed[i][0]) < 1e-10, "streamed attention must match reference attention");
 }
