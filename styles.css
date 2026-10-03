@@ -61,7 +61,9 @@
 
   /* Layout */
   --max: 1180px;
-  --rail-w: 88px;
+  /* The chapter-number column. The rail sizes itself now; this one only has to
+     hold two digits and the timeline spine beside them. */
+  --rail-w: 4.5rem;
   --gutter: clamp(1.25rem, 3vw, 2.25rem);
 }
 
@@ -157,7 +159,48 @@ em { color: var(--vermilion); font-style: italic; }
   position: relative; z-index: 1;
   width: min(var(--max), calc(100% - 2 * var(--gutter)));
   margin: 0 auto;
-  padding: clamp(6rem, 13vw, 11rem) 0 clamp(5rem, 10vw, 8rem);
+  padding: clamp(5rem, 10vw, 8rem) 0 clamp(4rem, 8vw, 6rem);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 25rem);
+  column-gap: clamp(2rem, 4vw, 4rem);
+  align-items: start;
+}
+/* The headline keeps the full width. Squeezing it into one column broke the
+   line break the <br> is there to control, and the line is the best thing here. */
+.hero-head { grid-column: 1 / -1; }
+.hero-copy-block { grid-column: 1; min-width: 0; }
+
+/* The sweep is the one animated thing on the page: the FA-2 forward pass,
+   a K/V tile walking across the Q rows and folding each score into the running
+   (m, ℓ, O). It shows what chapter 3 and 4 then explain in words. */
+.hero-sweep {
+  display: none;
+  grid-column: 2;
+  grid-row: 2;
+  position: sticky;
+  top: clamp(2rem, 8vh, 5rem);
+  margin: 0;
+}
+.hero-sweep canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--rule);
+  background: var(--paper-1);
+}
+.hero-sweep figcaption {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: .7rem;
+  color: var(--ink-3);
+  font: 400 .78rem/1.4 var(--mono);
+}
+.hero-sweep b { color: var(--vermilion); font-weight: 700; }
+.hero-sweep i { font-style: normal; }
+
+@media (min-width: 1081px) {
+  .hero-sweep { display: block; }
 }
 
 .eyebrow {
@@ -182,7 +225,9 @@ h1, h2 {
   letter-spacing: -.02em;
 }
 h1 {
-  max-width: 14ch;
+  /* 14ch was narrower than "Do not write the" needs, so the <br> never took
+     effect and "the" sat alone on its own line. */
+  max-width: 24ch;
   margin-bottom: 1.6rem;
   font-size: clamp(3.2rem, 7.4vw, 5.6rem);
 }
@@ -283,7 +328,11 @@ h3 {
 .page-shell {
   position: relative; z-index: 1;
   display: grid;
-  grid-template-columns: var(--rail-w) minmax(0, 1fr);
+  /* The rail sizes to its longest label, not to a fixed guess. A chapter list
+     like "FlashAttention-2" needs more room than the chapter-number column does,
+     and forcing one width on both sliced the rail's own edge line through the
+     text. */
+  grid-template-columns: auto minmax(0, 1fr);
   width: min(1420px, 100%);
   margin: 0 auto;
 }
@@ -292,7 +341,8 @@ h3 {
   position: sticky; top: 0;
   align-self: start;
   height: 100vh;
-  padding: 1.6rem 0 1.6rem 1.2rem;
+  min-width: var(--rail-w);
+  padding: 1.6rem 1.2rem 1.6rem 1.2rem;
   border-right: 1px solid var(--rule);
   background: var(--paper-0);
   font: 400 .8rem/1.2 var(--mono);
@@ -426,6 +476,10 @@ main > section.chapter:nth-of-type(9) { --i: 7; }
 /* Reset element-selector bleed (defensive — keep type selectors minimal) */
 p { color: inherit; }
 
+/* The resume link carries `hidden` until there is a saved position to resume.
+   Author-level `display` beats the user-agent [hidden] rule, so state it here. */
+[hidden] { display: none !important; }
+
 .compare-strip, .three-up, .kernel-map {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -463,8 +517,10 @@ p { color: inherit; }
 
 .prose-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(240px, .8fr);
-  gap: clamp(2rem, 5vw, 4.5rem);
+  /* The aside was 240px wide, which held about 23 characters of monospace —
+     too narrow to read. Give it a real measure and take the space from the gap. */
+  grid-template-columns: minmax(0, 1fr) minmax(320px, 27rem);
+  gap: clamp(1.75rem, 3.5vw, 3rem);
   align-items: start;
 }
 .prose-grid > div > p { color: var(--ink-2); }
@@ -925,6 +981,7 @@ footer {
 
 @media (max-width: 1080px) {
   .prose-grid { grid-template-columns: minmax(0, 1fr); }
+  .hero-inner { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 960px) {
@@ -962,7 +1019,13 @@ footer {
 @media (max-width: 640px) {
   body { font-size: 16px; }
   .hero { min-height: 540px; }
+  /* At 3.2rem the first line did not fit, so the <br> lost and "the" ended up
+     alone on a line of its own. A little smaller and the intended break holds. */
+  h1 { font-size: 2.25rem; }
   .hero-inner { width: min(100% - 2rem, var(--max)); padding-top: 5.5rem; padding-bottom: 4rem; }
+  /* At 390px the trailing V was wrapping onto its own line. Tighten the type
+     and the gaps so the equation stays on one row. */
+  .hero-equation { font-size: .95rem; gap: .3rem .4rem; padding: .9rem 1rem; }
   .hero-grid { background-size: 60px 60px; mask-image: radial-gradient(circle at 90% 10%, black 0%, black 30%, transparent 70%); -webkit-mask-image: radial-gradient(circle at 90% 10%, black 0%, black 30%, transparent 70%); }
   .hero-actions { align-items: stretch; }
   .hero-cta, .resume-link { flex: 1 1 100%; }

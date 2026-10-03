@@ -467,13 +467,26 @@ try {
     assert.equal(await page.eval(`localStorage.getItem("fa2-guide-last-chapter")`), "flash2");
   });
 
+  await check("a first visit offers no resume link, and hides it for real", async () => {
+    await page.eval(`localStorage.clear()`);
+    await page.goto(server.url);
+    const state = await page.eval(`(() => {
+      const link = document.querySelector("#resume-reading");
+      return { hidden: link.hidden, display: getComputedStyle(link).display };
+    })()`);
+    assert.equal(state.hidden, true, "no saved position means no resume link");
+    assert.equal(state.display, "none", "`hidden` must survive the button's own display rule");
+  });
+
   await check("a return visit offers to resume where the reader stopped", async () => {
+    await page.eval(`localStorage.setItem("fa2-guide-last-chapter", "flash2")`);
     await page.goto(server.url);
     const resume = await page.eval(`(() => {
       const link = document.querySelector("#resume-reading");
-      return { hidden: link.hidden, href: link.getAttribute("href"), text: link.textContent.trim() };
+      return { hidden: link.hidden, display: getComputedStyle(link).display, href: link.getAttribute("href"), text: link.textContent.trim() };
     })()`);
     assert.equal(resume.hidden, false);
+    assert.notEqual(resume.display, "none");
     assert.equal(resume.href, "#flash2");
     assert.match(resume.text, /Resume chapter 04/);
   });
@@ -567,6 +580,73 @@ try {
     assert.equal(await page.eval('document.querySelector("#backward-play-btn").disabled'), false);
     await sleep(1200);
     assert.equal(await page.text("#backward-step"), "—", "reset must clear the timer");
+  });
+
+  // ------------------------------------------------------ hero sweep ---
+  section("hero · forward-pass sweep");
+
+  await check("the sweep canvas is drawn at the hero's size", async () => {
+    const box = await page.eval(`(() => {
+      const c = document.querySelector("#hero-sweep-canvas");
+      const r = c.getBoundingClientRect();
+      return { w: Math.round(r.width), h: Math.round(r.height), bw: c.width, bh: c.height };
+    })()`);
+    assert.ok(box.w > 200, `canvas should have real width, got ${box.w}`);
+    // device pixels track CSS pixels, so the canvas is not upscaled or blurred
+    assert.ok(Math.abs(box.bw - box.w) <= 2, `backing store ${box.bw} vs layout ${box.w}`);
+    assert.ok(box.bh > box.bw / 2 && box.bh < box.bw * 2, `unexpected aspect: ${box.bw}x${box.bh}`);
+  });
+
+  await check("it actually paints, and the caption advances", async () => {
+    // The sweep holds on the finished pass for a beat, so two samples a fixed
+    // distance apart can legitimately read the same. Poll instead.
+    const seen = new Set();
+    for (let i = 0; i < 20; i++) {
+      seen.add(await page.text("#hero-sweep-count"));
+      await sleep(200);
+    }
+    assert.ok(seen.size >= 2, `the counter never moved, stuck on "${[...seen][0]}"`);
+    for (const value of seen) assert.match(value, /^[1-7] \/ 7 tiles$/);
+    const painted = await page.eval(`(() => {
+      const c = document.querySelector("#hero-sweep-canvas");
+      const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+      let lit = 0;
+      for (let i = 3; i < d.length; i += 4) if (d[i] > 0) lit++;
+      return lit;
+    })()`);
+    assert.ok(painted > 5000, `expected ink on the canvas, found ${painted} lit pixels`);
+  });
+
+  await check("reduced motion freezes it on the finished frame", async () => {
+    await page.setReducedMotion(true);
+    await sleep(700);
+    const still = await page.eval(`(() => {
+      const c = document.querySelector("#hero-sweep-canvas");
+      const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+      let hash = 0;
+      for (let i = 3; i < d.length; i += 400) hash = (hash + d[i] * (i % 97)) % 1000003;
+      return { hash, count: document.querySelector("#hero-sweep-count").textContent };
+    })()`);
+    await sleep(700);
+    const again = await page.eval(`(() => {
+      const c = document.querySelector("#hero-sweep-canvas");
+      const d = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+      let hash = 0;
+      for (let i = 3; i < d.length; i += 400) hash = (hash + d[i] * (i % 97)) % 1000003;
+      return hash;
+    })()`);
+    assert.equal(still.count, "7 / 7 tiles", "a still frame should show the finished pass");
+    assert.equal(again, still.hash, "the canvas must not repaint under reduced motion");
+    await page.setReducedMotion(false);
+  });
+
+  await check("the sweep carries a description for screen readers", async () => {
+    const label = await page.eval(`(() => {
+      const c = document.querySelector("#hero-sweep-canvas");
+      return { role: c.getAttribute("role"), label: (c.getAttribute("aria-label") || "").length };
+    })()`);
+    assert.equal(label.role, "img");
+    assert.ok(label.label > 60, `aria-label too short to be useful: ${label.label} chars`);
   });
 
   // -------------------------------------------------- accessibility ---

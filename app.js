@@ -259,6 +259,166 @@ function formatNumber(value) {
 
 export const _internals = { formatBytes, formatNumber };
 
+// --- Hero: the forward pass, drawn ------------------------------------------
+//
+// The whole guide is one idea: you never write the N x N score matrix. You keep
+// one K/V tile on chip, walk it across the query rows, and fold every tile into
+// three running numbers. So the hero draws that, once, on a loop.
+//
+// Six query rows, seven tiles. The tile is the only thing that moves; the rows
+// behind it have already been folded in and never need revisiting. That is the
+// whole trick, so the picture shows nothing else.
+
+const SWEEP_ROWS = 6;
+const SWEEP_TILES = 7;
+const SWEEP_STEP_MS = 420;
+const SWEEP_HOLD_MS = 1900;
+
+function initializeHeroSweep() {
+  const canvas = document.querySelector("#hero-sweep-canvas");
+  if (!canvas) return;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  const countEl = document.querySelector("#hero-sweep-count");
+  const phaseEl = document.querySelector("#hero-sweep-phase");
+
+  const styles = getComputedStyle(document.documentElement);
+  const paper = styles.getPropertyValue("--paper-1").trim() || "#15191F";
+  const rule = styles.getPropertyValue("--rule").trim() || "#2A2E34";
+  const ink3 = styles.getPropertyValue("--ink-3").trim() || "#6E6A5F";
+  const vermilion = styles.getPropertyValue("--vermilion").trim() || "#C8553D";
+
+  // How far along each row is, once `folded` tiles have landed. Deliberately
+  // uneven: rows converge at different rates, and a row that stops early is
+  // what "the output is already stable" looks like.
+  const CONVERGE = [0.94, 0.72, 0.86, 0.55, 0.78, 0.63];
+
+  const prefersStill = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+  const draw = (folded, active, progress) => {
+    const w = canvas.width;
+    const h = canvas.height;
+    const padX = 18;
+    const padTop = 16;
+    const labelW = 30;
+    const gapX = 3;
+    const gapY = 4;
+    const cols = SWEEP_TILES;
+    const rows = SWEEP_ROWS;
+    const cellW = (w - padX * 2 - labelW) / cols;
+    const cellH = (h - padTop * 2) / rows;
+
+    context.clearRect(0, 0, w, h);
+
+    for (let row = 0; row < rows; row++) {
+      const y = padTop + row * cellH;
+      context.fillStyle = ink3;
+      context.globalAlpha = 0.9;
+      context.font = "11px ui-monospace, monospace";
+      context.textAlign = "right";
+      context.textBaseline = "middle";
+      context.fillText(`q${row + 1}`, labelW + padX - 8, y + cellH / 2);
+      context.globalAlpha = 1;
+
+      for (let col = 0; col < cols; col++) {
+        const x = padX + labelW + col * cellW;
+        const box = [x + gapX / 2, y + gapY / 2, cellW - gapX, cellH - gapY];
+
+        // Not reached yet: an empty slot waiting for its tile.
+        if (col > active) {
+          context.strokeStyle = rule;
+          context.lineWidth = 1;
+          context.strokeRect(box[0] + 0.5, box[1] + 0.5, box[2] - 1, box[3] - 1);
+          continue;
+        }
+
+        // Already folded into the running sum.
+        const share = Math.min(1, CONVERGE[row] * ((col + 1) / cols));
+        context.fillStyle = vermilion;
+        context.globalAlpha = 0.18 + 0.5 * share;
+        context.fillRect(box[0], box[1], box[2], box[3]);
+        context.globalAlpha = 1;
+
+        // The tile on chip right now, mid-sweep.
+        if (col === active) {
+          context.fillStyle = vermilion;
+          context.globalAlpha = 0.9;
+          context.fillRect(box[0], box[1], box[2] * progress, box[3]);
+          context.globalAlpha = 1;
+        }
+        context.strokeStyle = rule;
+        context.lineWidth = 1;
+        context.strokeRect(box[0] + 0.5, box[1] + 0.5, box[2] - 1, box[3] - 1);
+      }
+    }
+
+    // The on-chip tile, drawn as the single shared block it is.
+    const tileX = padX + labelW + active * cellW;
+    context.strokeStyle = vermilion;
+    context.lineWidth = 1.5;
+    context.strokeRect(tileX + 1, padTop + 1, cellW - 2, (h - padTop * 2) - 2);
+  };
+
+  let frame = 0;
+  let folded = 0;
+  let startedAt = performance.now();
+
+  const paint = () => {
+    if (prefersStill.matches) {
+      // One finished frame. The tile has been all the way across and every row
+      // holds its answer; nothing moves.
+      draw(SWEEP_TILES, SWEEP_TILES - 1, 1);
+      if (countEl) countEl.textContent = `${SWEEP_TILES} / ${SWEEP_TILES} tiles`;
+      if (phaseEl) phaseEl.textContent = "every row holds its answer";
+      return;
+    }
+    const elapsed = performance.now() - startedAt;
+    const perTile = SWEEP_STEP_MS;
+    const cycle = perTile * SWEEP_TILES + SWEEP_HOLD_MS;
+    const now = elapsed % cycle;
+    const running = now < perTile * SWEEP_TILES;
+    const slot = Math.min(SWEEP_TILES - 1, Math.floor(now / perTile));
+    const progress = running ? (now % perTile) / perTile : 1;
+
+    draw(Math.min(folded, slot + 1), slot, progress);
+    folded = slot + 1;
+
+    if (countEl) countEl.textContent = `${folded} / ${SWEEP_TILES} tiles`;
+    if (phaseEl) {
+      phaseEl.textContent = running
+        ? "one K/V tile on chip"
+        : "no tile in flight, nothing written to HBM";
+    }
+    frame = requestAnimationFrame(paint);
+  };
+
+  const fit = () => {
+    const width = Math.max(260, Math.round(canvas.getBoundingClientRect().width));
+    // 7 columns by 6 rows, so this ratio keeps the tiles square rather than
+    // turning the grid into tall stripes.
+    const ratio = SWEEP_TILES / SWEEP_ROWS;
+    if (canvas.width === width) return;
+    canvas.width = width;
+    canvas.height = Math.round(width * ratio);
+  };
+
+  fit();
+  new ResizeObserver(fit).observe(canvas);
+  prefersStill.addEventListener("change", () => {
+    cancelAnimationFrame(frame);
+    startedAt = performance.now();
+    paint();
+  });
+  document.addEventListener("visibilitychange", () => {
+    cancelAnimationFrame(frame);
+    // Coming back from a hidden tab would otherwise jump the sweep forward by
+    // however long you were away.
+    startedAt = performance.now();
+    if (!document.hidden) paint();
+  });
+  paint();
+}
+
 function initializeTileObservatory() {
   const root = document.querySelector("#tile-size");
   if (!root) return;
@@ -723,6 +883,7 @@ function initializeBackwardVisualization() {
 }
 
 if (typeof document !== "undefined") {
+  initializeHeroSweep();
   initializeAttentionCalculator();
   initializeStreamingState();
   initializeTileObservatory();

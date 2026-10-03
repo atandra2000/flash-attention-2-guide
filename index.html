@@ -16,8 +16,11 @@
         <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
       </div>
       <div class="hero-inner">
+        <div class="hero-head">
         <p class="eyebrow">Field guide / exact attention / v2</p>
         <h1>Do not write the<br><em>attention matrix.</em></h1>
+        </div>
+        <div class="hero-copy-block">
         <p class="hero-copy">FlashAttention-2 computes the same attention result. Its advantage is treating memory movement, numerical stability, and GPU parallelism as first-class algorithmic constraints — and the argument is a tight, IO-aware proof of an asymptotic lower bound.</p>
         <div class="hero-equation" aria-label="Output equals softmax of Q K transpose over square root d plus mask, multiplied by V">
           <span>O</span><b>=</b><span>softmax</span><span class="formula">(QK<sup>T</sup> / √d + M)</span><span>V</span>
@@ -28,6 +31,12 @@
           <a class="resume-link" id="resume-reading" href="#attention" hidden>Resume where you left off <span aria-hidden="true">↗</span></a>
         </div>
         <p class="hero-note">8 chapters · 7 live models · keyboard-friendly walkthroughs</p>
+        </div>
+        <figure class="hero-sweep">
+          <canvas id="hero-sweep-canvas" role="img"
+            aria-label="A diagram of the FlashAttention-2 forward pass: six query rows on the left, a key and value tile sweeping left to right across them, and each row's output growing as every tile is folded into its running sum."></canvas>
+          <figcaption><span>Forward pass, <i id="hero-sweep-phase">one K/V tile on chip</i></span><b id="hero-sweep-count">0 / 7 tiles</b></figcaption>
+        </figure>
       </div>
     </header>
 

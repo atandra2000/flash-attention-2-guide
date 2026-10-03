@@ -24,6 +24,12 @@ implementations (GPT-2 → FlashAttention-style attention in raw PyTorch).
 | 07 · Landscape | Where FA-2 sits among attention implementations |
 | 08 · Foundations | Prerequisites and further reading |
 
+The hero draws the forward pass once on a loop: a single K/V tile walks
+across six query rows, and each row's output grows as the tile is folded
+into its running sum. It is the one animated thing on the page, it stops
+dead under `prefers-reduced-motion`, and it is described in text for
+screen readers.
+
 Interactive widgets: an attention calculator, a step-through tile
 visualizer, a memory-byte counter with speedup model, a tile-size slider,
 and a backward-pass flow diagram — all with static fallbacks, keyboard
