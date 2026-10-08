@@ -7,3 +7,6 @@ docs/superpowers/
 
 # macOS
 *.DS_Store
+
+# codegraph index (binary, local only)
+.codegraph/
